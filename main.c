@@ -44,8 +44,6 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 #define VISIBLE     10
 #define ROW_H       13
 
-typedef unsigned int u32;
-
 #define C(r, g, b) (0xFF000000u | ((u32)(b) << 16) | ((u32)(g) << 8) | (u32)(r))
 
 /* ------------------------------------------------------------------ */
@@ -407,7 +405,7 @@ static void dec_close(Dec *d)
 static int fill_stream(Dec *d)
 {
     unsigned char *dst;
-    int towrite, srcpos;
+  SceInt32 towrite, srcpos;
     if (sceMp3GetInfoToAddStreamData(d->h, &dst, &towrite, &srcpos) < 0) return -1;
     sceIoLseek32(d->fd, srcpos, PSP_SEEK_SET);
     int r = sceIoRead(d->fd, dst, towrite);
