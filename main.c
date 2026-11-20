@@ -1,777 +1,1185 @@
-/*
- * SOFT CLUB PLAYER - MP3 player for PSP (custom firmware required)
- * Gen X / soft club vibe, switchable themes.
+/* ======================================================================
+ *  SOFT//CLUB  -  MP3 player for PSP (custom firmware)
  *
- * Music folder: ms0:/MUSIC/   (MP3 files, no subfolders)
+ *  - MP3 files from  ms0:/MUSIC/  (or ef0:/MUSIC/ on PSP Go)
+ *  - audio runs in its own thread, so the UI can never make it stutter
+ *  - the UI is software-drawn, the background is pre-rendered once per theme
+ *    and the screen is redrawn only when something actually changed
+ *  - every track fully releases its decoder / audio channel / file,
+ *    so switching tracks any number of times works
  *
- * Controls:
- *   UP / DOWN     choose track
- *   CROSS         play selected track (or pause if it is already playing)
- *   CIRCLE        play / pause
- *   L / R         previous / next track
- *   LEFT / RIGHT  volume down / up
- *   TRIANGLE      next theme
- *   SQUARE        previous theme
- */
-
+ *  Controls
+ *    UP / DOWN      move in the list
+ *    LEFT / RIGHT   volume
+ *    CROSS (X)      play selected track / pause / resume
+ *    SQUARE         stop
+ *    L / R          previous / next track
+ *    TRIANGLE       next theme
+ * ====================================================================== */
 #include <pspkernel.h>
-#include <pspdebug.h>
 #include <pspdisplay.h>
-#include <pspctrl.h>
 #include <pspge.h>
+#include <pspctrl.h>
 #include <pspaudio.h>
 #include <pspmp3.h>
 #include <psputility.h>
 #include <psppower.h>
-#include <pspiofilemgr.h>
-
+#include <psputils.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <ctype.h>
-#include <math.h>
 
-PSP_MODULE_INFO("SoftClub", 0, 1, 1);
+PSP_MODULE_INFO("SoftClub", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
+PSP_HEAP_SIZE_KB(1024);
 
-#define MUSIC_DIR   "ms0:/MUSIC"
-#define CFG_PATH    "ms0:/PSP/GAME/SoftClub/theme.cfg"
-#define MAX_TRACKS  512
-#define SCR_W       480
-#define SCR_H       272
-#define STRIDE      512
-#define VISIBLE     10
-#define ROW_H       13
+/* ---------------------------------------------------------------- setup */
+#define SW 480
+#define SH 272
+#define SB 512                     /* framebuffer stride (pixels) */
+#define FRAME_BYTES (SB * SH * 4)
 
-#define C(r, g, b) (0xFF000000u | ((u32)(b) << 16) | ((u32)(g) << 8) | (u32)(r))
+#define MAX_TRACKS   256
+#define LIST_ROWS    9
+#define N_THEMES     5
 
-/* ------------------------------------------------------------------ */
-/* THEMES - add your own here, everything else adapts automatically    */
-/* ------------------------------------------------------------------ */
+#define MP3_BUF_SIZE (16 * 1024)
+#define PCM_BUF_SIZE (16 * 1024)
+#define OUT_BLOCK    1024          /* samples per audio output block (multiple of 64) */
 
-typedef struct {
-    const char *name;
-    u32 bg_top, bg_bot;      /* background gradient                  */
-    u32 panel; int panel_a;  /* glass panel colour + opacity (0-255) */
-    u32 edge;                /* panel border colour                  */
-    u32 text, dim;           /* main / secondary text                */
-    u32 accent, accent2;     /* progress bar, labels                 */
-    u32 sel_bg, sel_text;    /* selected row                         */
-    u32 bar_bg;              /* empty bar background                 */
-    u32 bubble; int bubbles; /* soft translucent bubbles             */
-    int grain;               /* film grain strength (0 = off)        */
-    int scan;                /* CRT scanlines (0/1)                  */
-    int gloss;               /* glossy highlight on panels (0/1)     */
-} Theme;
+enum { ST_STOP = 0, ST_LOAD, ST_PLAY, ST_PAUSE, ST_ERROR };
+enum { PR_ENDED = 0, PR_REQUEST, PR_ERROR, PR_QUIT };
 
-static const Theme THEMES[] = {
-    { "SOFT CLUB",
-      C(150,214,226), C(206,186,230),
-      C(244,250,255), 170, C(255,255,255),
-      C(38,62,96),  C(98,120,150),
-      C(40,160,190), C(224,110,160),
-      C(70,176,205), C(255,255,255),
-      C(190,214,230),
-      C(255,255,255), 7, 0, 0, 1 },
-
-    { "GEN X",
-      C(66,58,46), C(28,25,22),
-      C(92,82,66), 200, C(210,170,90),
-      C(232,216,176), C(160,144,112),
-      C(222,168,52), C(196,88,52),
-      C(176,78,48), C(250,236,200),
-      C(48,43,36),
-      C(255,255,255), 0, 14, 1, 0 },
-
-    { "MIDNIGHT LOUNGE",
-      C(16,18,56), C(70,22,88),
-      C(30,32,84), 190, C(110,120,220),
-      C(204,222,255), C(124,136,190),
-      C(70,226,234), C(236,76,176),
-      C(120,40,160), C(255,255,255),
-      C(18,20,52),
-      C(120,200,255), 5, 4, 0, 1 },
-
-    { "FROSTED SILVER",
-      C(248,249,252), C(184,192,206),
-      C(255,255,255), 190, C(255,255,255),
-      C(46,52,68), C(120,128,142),
-      C(64,116,224), C(140,150,168),
-      C(64,116,224), C(255,255,255),
-      C(200,206,218),
-      C(255,255,255), 4, 0, 0, 1 },
-
-    { "PEACH FIZZ",
-      C(255,206,176), C(236,148,176),
-      C(255,244,238), 175, C(255,255,255),
-      C(104,44,60), C(170,110,120),
-      C(232,96,120), C(250,160,80),
-      C(232,110,130), C(255,255,255),
-      C(246,206,200),
-      C(255,255,255), 8, 0, 0, 1 },
+/* Bitmap fonts (public-domain X11 misc-fixed style), glyphs 32..126, MSB = left pixel */
+static const unsigned char FONT_S[95][10] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /*   */
+    {0x00,0x10,0x10,0x10,0x10,0x10,0x00,0x10,0x00,0x00}, /* ! */
+    {0x00,0x28,0x28,0x28,0x00,0x00,0x00,0x00,0x00,0x00}, /* " */
+    {0x00,0x28,0x28,0x7C,0x28,0x7C,0x28,0x28,0x00,0x00}, /* # */
+    {0x00,0x10,0x38,0x50,0x38,0x14,0x38,0x10,0x00,0x00}, /* $ */
+    {0x00,0x24,0x54,0x28,0x10,0x28,0x54,0x48,0x00,0x00}, /* % */
+    {0x00,0x20,0x50,0x50,0x20,0x54,0x48,0x34,0x00,0x00}, /* & */
+    {0x00,0x18,0x10,0x20,0x00,0x00,0x00,0x00,0x00,0x00}, /* ' */
+    {0x00,0x08,0x10,0x20,0x20,0x20,0x10,0x08,0x00,0x00}, /* ( */
+    {0x00,0x20,0x10,0x08,0x08,0x08,0x10,0x20,0x00,0x00}, /* ) */
+    {0x00,0x00,0x44,0x28,0x7C,0x28,0x44,0x00,0x00,0x00}, /* ? */
+    {0x00,0x00,0x10,0x10,0x7C,0x10,0x10,0x00,0x00,0x00}, /* + */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x10,0x20,0x00}, /* , */
+    {0x00,0x00,0x00,0x00,0x7C,0x00,0x00,0x00,0x00,0x00}, /* - */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x10,0x38,0x10,0x00}, /* . */
+    {0x00,0x04,0x04,0x08,0x10,0x20,0x40,0x40,0x00,0x00}, /* ? */
+    {0x00,0x10,0x28,0x44,0x44,0x44,0x28,0x10,0x00,0x00}, /* 0 */
+    {0x00,0x10,0x30,0x50,0x10,0x10,0x10,0x7C,0x00,0x00}, /* 1 */
+    {0x00,0x38,0x44,0x04,0x18,0x20,0x40,0x7C,0x00,0x00}, /* 2 */
+    {0x00,0x7C,0x04,0x08,0x18,0x04,0x44,0x38,0x00,0x00}, /* 3 */
+    {0x00,0x08,0x18,0x28,0x48,0x7C,0x08,0x08,0x00,0x00}, /* 4 */
+    {0x00,0x7C,0x40,0x58,0x64,0x04,0x44,0x38,0x00,0x00}, /* 5 */
+    {0x00,0x18,0x20,0x40,0x58,0x64,0x44,0x38,0x00,0x00}, /* 6 */
+    {0x00,0x7C,0x04,0x08,0x08,0x10,0x20,0x20,0x00,0x00}, /* 7 */
+    {0x00,0x38,0x44,0x44,0x38,0x44,0x44,0x38,0x00,0x00}, /* 8 */
+    {0x00,0x38,0x44,0x4C,0x34,0x04,0x08,0x30,0x00,0x00}, /* 9 */
+    {0x00,0x00,0x10,0x38,0x10,0x00,0x10,0x38,0x10,0x00}, /* : */
+    {0x00,0x00,0x10,0x38,0x10,0x00,0x18,0x10,0x20,0x00}, /* ; */
+    {0x00,0x04,0x08,0x10,0x20,0x10,0x08,0x04,0x00,0x00}, /* < */
+    {0x00,0x00,0x00,0x7C,0x00,0x7C,0x00,0x00,0x00,0x00}, /* = */
+    {0x00,0x40,0x20,0x10,0x08,0x10,0x20,0x40,0x00,0x00}, /* > */
+    {0x00,0x38,0x44,0x08,0x10,0x10,0x00,0x10,0x00,0x00}, /* ? */
+    {0x00,0x38,0x44,0x4C,0x54,0x58,0x40,0x38,0x00,0x00}, /* @ */
+    {0x00,0x10,0x28,0x44,0x44,0x7C,0x44,0x44,0x00,0x00}, /* A */
+    {0x00,0x78,0x24,0x24,0x38,0x24,0x24,0x78,0x00,0x00}, /* B */
+    {0x00,0x38,0x44,0x40,0x40,0x40,0x44,0x38,0x00,0x00}, /* C */
+    {0x00,0x78,0x24,0x24,0x24,0x24,0x24,0x78,0x00,0x00}, /* D */
+    {0x00,0x7C,0x40,0x40,0x78,0x40,0x40,0x7C,0x00,0x00}, /* E */
+    {0x00,0x7C,0x40,0x40,0x78,0x40,0x40,0x40,0x00,0x00}, /* F */
+    {0x00,0x38,0x44,0x40,0x40,0x4C,0x44,0x38,0x00,0x00}, /* G */
+    {0x00,0x44,0x44,0x44,0x7C,0x44,0x44,0x44,0x00,0x00}, /* H */
+    {0x00,0x38,0x10,0x10,0x10,0x10,0x10,0x38,0x00,0x00}, /* I */
+    {0x00,0x1C,0x04,0x04,0x04,0x04,0x44,0x38,0x00,0x00}, /* J */
+    {0x00,0x44,0x48,0x50,0x60,0x50,0x48,0x44,0x00,0x00}, /* K */
+    {0x00,0x40,0x40,0x40,0x40,0x40,0x40,0x7C,0x00,0x00}, /* L */
+    {0x00,0x44,0x44,0x6C,0x54,0x44,0x44,0x44,0x00,0x00}, /* M */
+    {0x00,0x44,0x44,0x64,0x54,0x4C,0x44,0x44,0x00,0x00}, /* N */
+    {0x00,0x38,0x44,0x44,0x44,0x44,0x44,0x38,0x00,0x00}, /* O */
+    {0x00,0x78,0x44,0x44,0x78,0x40,0x40,0x40,0x00,0x00}, /* P */
+    {0x00,0x38,0x44,0x44,0x44,0x44,0x54,0x38,0x04,0x00}, /* Q */
+    {0x00,0x78,0x44,0x44,0x78,0x50,0x48,0x44,0x00,0x00}, /* R */
+    {0x00,0x38,0x44,0x40,0x38,0x04,0x44,0x38,0x00,0x00}, /* S */
+    {0x00,0x7C,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00}, /* T */
+    {0x00,0x44,0x44,0x44,0x44,0x44,0x44,0x38,0x00,0x00}, /* U */
+    {0x00,0x44,0x44,0x44,0x28,0x28,0x28,0x10,0x00,0x00}, /* V */
+    {0x00,0x44,0x44,0x44,0x54,0x54,0x6C,0x44,0x00,0x00}, /* W */
+    {0x00,0x44,0x44,0x28,0x10,0x28,0x44,0x44,0x00,0x00}, /* X */
+    {0x00,0x44,0x44,0x28,0x10,0x10,0x10,0x10,0x00,0x00}, /* Y */
+    {0x00,0x7C,0x04,0x08,0x10,0x20,0x40,0x7C,0x00,0x00}, /* Z */
+    {0x00,0x38,0x20,0x20,0x20,0x20,0x20,0x38,0x00,0x00}, /* [ */
+    {0x00,0x40,0x40,0x20,0x10,0x08,0x04,0x04,0x00,0x00}, /* ? */
+    {0x00,0x38,0x08,0x08,0x08,0x08,0x08,0x38,0x00,0x00}, /* ] */
+    {0x00,0x10,0x28,0x44,0x00,0x00,0x00,0x00,0x00,0x00}, /* ^ */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7C,0x00}, /* _ */
+    {0x00,0x30,0x10,0x08,0x00,0x00,0x00,0x00,0x00,0x00}, /* ` */
+    {0x00,0x00,0x00,0x38,0x04,0x3C,0x44,0x3C,0x00,0x00}, /* a */
+    {0x00,0x40,0x40,0x58,0x64,0x44,0x64,0x58,0x00,0x00}, /* b */
+    {0x00,0x00,0x00,0x38,0x44,0x40,0x44,0x38,0x00,0x00}, /* c */
+    {0x00,0x04,0x04,0x34,0x4C,0x44,0x4C,0x34,0x00,0x00}, /* d */
+    {0x00,0x00,0x00,0x38,0x44,0x7C,0x40,0x38,0x00,0x00}, /* e */
+    {0x00,0x18,0x24,0x20,0x78,0x20,0x20,0x20,0x00,0x00}, /* f */
+    {0x00,0x00,0x00,0x34,0x48,0x30,0x40,0x38,0x44,0x38}, /* g */
+    {0x00,0x40,0x40,0x58,0x64,0x44,0x44,0x44,0x00,0x00}, /* h */
+    {0x00,0x10,0x00,0x30,0x10,0x10,0x10,0x38,0x00,0x00}, /* i */
+    {0x00,0x08,0x00,0x18,0x08,0x08,0x08,0x48,0x48,0x30}, /* j */
+    {0x00,0x40,0x40,0x44,0x48,0x70,0x48,0x44,0x00,0x00}, /* k */
+    {0x00,0x30,0x10,0x10,0x10,0x10,0x10,0x38,0x00,0x00}, /* l */
+    {0x00,0x00,0x00,0x68,0x54,0x54,0x54,0x44,0x00,0x00}, /* m */
+    {0x00,0x00,0x00,0x58,0x64,0x44,0x44,0x44,0x00,0x00}, /* n */
+    {0x00,0x00,0x00,0x38,0x44,0x44,0x44,0x38,0x00,0x00}, /* o */
+    {0x00,0x00,0x00,0x58,0x64,0x64,0x58,0x40,0x40,0x40}, /* p */
+    {0x00,0x00,0x00,0x34,0x4C,0x4C,0x34,0x04,0x04,0x04}, /* q */
+    {0x00,0x00,0x00,0x58,0x64,0x40,0x40,0x40,0x00,0x00}, /* r */
+    {0x00,0x00,0x00,0x38,0x40,0x38,0x04,0x78,0x00,0x00}, /* s */
+    {0x00,0x20,0x20,0x78,0x20,0x20,0x24,0x18,0x00,0x00}, /* t */
+    {0x00,0x00,0x00,0x44,0x44,0x44,0x4C,0x34,0x00,0x00}, /* u */
+    {0x00,0x00,0x00,0x44,0x44,0x28,0x28,0x10,0x00,0x00}, /* v */
+    {0x00,0x00,0x00,0x44,0x44,0x54,0x54,0x28,0x00,0x00}, /* w */
+    {0x00,0x00,0x00,0x44,0x28,0x10,0x28,0x44,0x00,0x00}, /* x */
+    {0x00,0x00,0x00,0x44,0x44,0x4C,0x34,0x04,0x44,0x38}, /* y */
+    {0x00,0x00,0x00,0x7C,0x08,0x10,0x20,0x7C,0x00,0x00}, /* z */
+    {0x00,0x0C,0x10,0x08,0x30,0x08,0x10,0x0C,0x00,0x00}, /* { */
+    {0x00,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00}, /* | */
+    {0x00,0x60,0x10,0x20,0x18,0x20,0x10,0x60,0x00,0x00}, /* } */
+    {0x00,0x24,0x54,0x48,0x00,0x00,0x00,0x00,0x00,0x00}, /* ~ */
 };
-#define THEME_COUNT ((int)(sizeof(THEMES) / sizeof(THEMES[0])))
+static const unsigned char FONT_B[95][13] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /*   */
+    {0x00,0x00,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x00,0x00}, /* ! */
+    {0x00,0x00,0xD8,0xD8,0xD8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* " */
+    {0x00,0x00,0x00,0x78,0x78,0xFC,0x78,0xFC,0x78,0x78,0x00,0x00,0x00}, /* # */
+    {0x00,0x00,0x00,0x30,0x78,0xF0,0x78,0x3C,0x78,0x30,0x00,0x00,0x00}, /* $ */
+    {0x00,0x00,0x6C,0xFC,0x78,0x18,0x30,0x60,0x78,0xFC,0xD8,0x00,0x00}, /* % */
+    {0x00,0x00,0x00,0x00,0x60,0xF0,0xF0,0x60,0xFC,0xD8,0x7C,0x00,0x00}, /* & */
+    {0x00,0x00,0x30,0x30,0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* ' */
+    {0x00,0x18,0x30,0x30,0x60,0x60,0x60,0x60,0x60,0x30,0x30,0x18,0x00}, /* ( */
+    {0x00,0x60,0x30,0x30,0x18,0x18,0x18,0x18,0x18,0x30,0x30,0x60,0x00}, /* ) */
+    {0x00,0x00,0x00,0x00,0xCC,0x78,0xFC,0x78,0xCC,0x00,0x00,0x00,0x00}, /* ? */
+    {0x00,0x00,0x00,0x00,0x30,0x30,0xFC,0x30,0x30,0x00,0x00,0x00,0x00}, /* + */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x38,0x30,0x60,0x00}, /* , */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0xFC,0x00,0x00,0x00,0x00,0x00,0x00}, /* - */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x78,0x30,0x00}, /* . */
+    {0x00,0x00,0x0C,0x0C,0x18,0x18,0x30,0x60,0x60,0xC0,0xC0,0x00,0x00}, /* ? */
+    {0x00,0x00,0x30,0x78,0xCC,0xCC,0xCC,0xCC,0xCC,0x78,0x30,0x00,0x00}, /* 0 */
+    {0x00,0x00,0x30,0x70,0xF0,0x30,0x30,0x30,0x30,0x30,0xFC,0x00,0x00}, /* 1 */
+    {0x00,0x00,0x78,0xCC,0xCC,0x0C,0x18,0x30,0x60,0xC0,0xFC,0x00,0x00}, /* 2 */
+    {0x00,0x00,0xFC,0x0C,0x18,0x30,0x78,0x0C,0x0C,0xCC,0x78,0x00,0x00}, /* 3 */
+    {0x00,0x00,0x18,0x18,0x38,0x78,0x58,0xD8,0xFC,0x18,0x18,0x00,0x00}, /* 4 */
+    {0x00,0x00,0xFC,0xC0,0xC0,0xF8,0xEC,0x0C,0x0C,0xCC,0x78,0x00,0x00}, /* 5 */
+    {0x00,0x00,0x38,0x60,0xC0,0xC0,0xF8,0xEC,0xCC,0xCC,0x78,0x00,0x00}, /* 6 */
+    {0x00,0x00,0xFC,0x0C,0x18,0x18,0x30,0x30,0x60,0x60,0x60,0x00,0x00}, /* 7 */
+    {0x00,0x00,0x78,0xCC,0xCC,0xCC,0x78,0xCC,0xCC,0xCC,0x78,0x00,0x00}, /* 8 */
+    {0x00,0x00,0x78,0xCC,0xCC,0xDC,0x7C,0x0C,0x0C,0x18,0x70,0x00,0x00}, /* 9 */
+    {0x00,0x00,0x00,0x30,0x78,0x30,0x00,0x00,0x30,0x78,0x30,0x00,0x00}, /* : */
+    {0x00,0x00,0x00,0x00,0x30,0x78,0x30,0x00,0x00,0x38,0x30,0x60,0x00}, /* ; */
+    {0x00,0x00,0x0C,0x18,0x30,0x60,0xC0,0x60,0x30,0x18,0x0C,0x00,0x00}, /* < */
+    {0x00,0x00,0x00,0x00,0x00,0xFC,0x00,0x00,0xFC,0x00,0x00,0x00,0x00}, /* = */
+    {0x00,0x00,0xC0,0x60,0x30,0x18,0x0C,0x18,0x30,0x60,0xC0,0x00,0x00}, /* > */
+    {0x00,0x00,0x78,0xCC,0xCC,0x0C,0x18,0x30,0x30,0x00,0x30,0x00,0x00}, /* ? */
+    {0x00,0x00,0x78,0xCC,0xCC,0xDC,0xFC,0xFC,0xF8,0xC0,0x7C,0x00,0x00}, /* @ */
+    {0x00,0x00,0x30,0x78,0xCC,0xCC,0xCC,0xFC,0xCC,0xCC,0xCC,0x00,0x00}, /* A */
+    {0x00,0x00,0xF8,0x6C,0x6C,0x6C,0x78,0x6C,0x6C,0x6C,0xF8,0x00,0x00}, /* B */
+    {0x00,0x00,0x78,0xCC,0xC0,0xC0,0xC0,0xC0,0xC0,0xCC,0x78,0x00,0x00}, /* C */
+    {0x00,0x00,0xF8,0x6C,0x6C,0x6C,0x6C,0x6C,0x6C,0x6C,0xF8,0x00,0x00}, /* D */
+    {0x00,0x00,0xFC,0xC0,0xC0,0xC0,0xF8,0xC0,0xC0,0xC0,0xFC,0x00,0x00}, /* E */
+    {0x00,0x00,0xFC,0xC0,0xC0,0xC0,0xF8,0xC0,0xC0,0xC0,0xC0,0x00,0x00}, /* F */
+    {0x00,0x00,0x78,0xCC,0xC0,0xC0,0xC0,0xDC,0xCC,0xCC,0x78,0x00,0x00}, /* G */
+    {0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xFC,0xCC,0xCC,0xCC,0xCC,0x00,0x00}, /* H */
+    {0x00,0x00,0x78,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x78,0x00,0x00}, /* I */
+    {0x00,0x00,0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0xCC,0x78,0x00,0x00}, /* J */
+    {0x00,0x00,0xCC,0xCC,0xD8,0xF0,0xE0,0xF0,0xD8,0xCC,0xCC,0x00,0x00}, /* K */
+    {0x00,0x00,0xC0,0xC0,0xC0,0xC0,0xC0,0xC0,0xC0,0xC0,0xFC,0x00,0x00}, /* L */
+    {0x00,0x00,0xCC,0xCC,0xFC,0xFC,0xFC,0xCC,0xCC,0xCC,0xCC,0x00,0x00}, /* M */
+    {0x00,0x00,0xCC,0xEC,0xEC,0xFC,0xFC,0xDC,0xDC,0xCC,0xCC,0x00,0x00}, /* N */
+    {0x00,0x00,0x78,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0x78,0x00,0x00}, /* O */
+    {0x00,0x00,0xF8,0xCC,0xCC,0xCC,0xF8,0xC0,0xC0,0xC0,0xC0,0x00,0x00}, /* P */
+    {0x00,0x00,0x78,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xFC,0x78,0x0C,0x00}, /* Q */
+    {0x00,0x00,0xF8,0xCC,0xCC,0xCC,0xF8,0xF0,0xD8,0xCC,0xCC,0x00,0x00}, /* R */
+    {0x00,0x00,0x78,0xCC,0xC0,0xC0,0x78,0x0C,0x0C,0xCC,0x78,0x00,0x00}, /* S */
+    {0x00,0x00,0xFC,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x00,0x00}, /* T */
+    {0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0x78,0x00,0x00}, /* U */
+    {0x00,0x00,0xCC,0xCC,0xCC,0xCC,0x78,0x78,0x78,0x30,0x30,0x00,0x00}, /* V */
+    {0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xFC,0xFC,0xFC,0xFC,0xCC,0x00,0x00}, /* W */
+    {0x00,0x00,0xCC,0xCC,0x78,0x78,0x30,0x78,0x78,0xCC,0xCC,0x00,0x00}, /* X */
+    {0x00,0x00,0xCC,0xCC,0x78,0x78,0x30,0x30,0x30,0x30,0x30,0x00,0x00}, /* Y */
+    {0x00,0x00,0xFC,0x0C,0x18,0x18,0x30,0x60,0x60,0xC0,0xFC,0x00,0x00}, /* Z */
+    {0x00,0x78,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x78,0x00}, /* [ */
+    {0x00,0x00,0xC0,0xC0,0x60,0x60,0x30,0x18,0x18,0x0C,0x0C,0x00,0x00}, /* ? */
+    {0x00,0x78,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x78,0x00}, /* ] */
+    {0x00,0x00,0x30,0x78,0xCC,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* ^ */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFC,0x00}, /* _ */
+    {0x00,0x60,0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* ` */
+    {0x00,0x00,0x00,0x00,0x00,0x78,0x0C,0x7C,0xCC,0xDC,0x6C,0x00,0x00}, /* a */
+    {0x00,0x00,0xC0,0xC0,0xC0,0xD8,0xEC,0xCC,0xCC,0xEC,0xD8,0x00,0x00}, /* b */
+    {0x00,0x00,0x00,0x00,0x00,0x78,0xCC,0xC0,0xC0,0xCC,0x78,0x00,0x00}, /* c */
+    {0x00,0x00,0x0C,0x0C,0x0C,0x6C,0xDC,0xCC,0xCC,0xDC,0x6C,0x00,0x00}, /* d */
+    {0x00,0x00,0x00,0x00,0x00,0x78,0xCC,0xFC,0xC0,0xC0,0x78,0x00,0x00}, /* e */
+    {0x00,0x00,0x38,0x6C,0x60,0x60,0xF8,0x60,0x60,0x60,0x60,0x00,0x00}, /* f */
+    {0x00,0x00,0x00,0x00,0x00,0x7C,0xD8,0xD8,0x70,0xC0,0x78,0xCC,0x78}, /* g */
+    {0x00,0x00,0xC0,0xC0,0xC0,0xD8,0xEC,0xCC,0xCC,0xCC,0xCC,0x00,0x00}, /* h */
+    {0x00,0x00,0x30,0x30,0x00,0x70,0x30,0x30,0x30,0x30,0x78,0x00,0x00}, /* i */
+    {0x00,0x00,0x18,0x18,0x00,0x38,0x18,0x18,0x18,0x18,0xD8,0xD8,0x70}, /* j */
+    {0x00,0x00,0xC0,0xC0,0xC0,0xD8,0xF0,0xE0,0xF0,0xD8,0xCC,0x00,0x00}, /* k */
+    {0x00,0x00,0x70,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x78,0x00,0x00}, /* l */
+    {0x00,0x00,0x00,0x00,0x00,0xF8,0xFC,0xFC,0xFC,0xFC,0xCC,0x00,0x00}, /* m */
+    {0x00,0x00,0x00,0x00,0x00,0xD8,0xEC,0xCC,0xCC,0xCC,0xCC,0x00,0x00}, /* n */
+    {0x00,0x00,0x00,0x00,0x00,0x78,0xCC,0xCC,0xCC,0xCC,0x78,0x00,0x00}, /* o */
+    {0x00,0x00,0x00,0x00,0x00,0xD8,0xEC,0xCC,0xEC,0xD8,0xC0,0xC0,0xC0}, /* p */
+    {0x00,0x00,0x00,0x00,0x00,0x6C,0xDC,0xCC,0xDC,0x6C,0x0C,0x0C,0x0C}, /* q */
+    {0x00,0x00,0x00,0x00,0x00,0xD8,0xEC,0xC0,0xC0,0xC0,0xC0,0x00,0x00}, /* r */
+    {0x00,0x00,0x00,0x00,0x00,0x78,0xCC,0x70,0x18,0xCC,0x78,0x00,0x00}, /* s */
+    {0x00,0x00,0x00,0x60,0x60,0xF8,0x60,0x60,0x60,0x6C,0x38,0x00,0x00}, /* t */
+    {0x00,0x00,0x00,0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xDC,0x6C,0x00,0x00}, /* u */
+    {0x00,0x00,0x00,0x00,0x00,0xCC,0xCC,0xCC,0x78,0x78,0x30,0x00,0x00}, /* v */
+    {0x00,0x00,0x00,0x00,0x00,0xCC,0xCC,0xFC,0xFC,0xFC,0x48,0x00,0x00}, /* w */
+    {0x00,0x00,0x00,0x00,0x00,0xCC,0x78,0x30,0x30,0x78,0xCC,0x00,0x00}, /* x */
+    {0x00,0x00,0x00,0x00,0x00,0xCC,0xCC,0xCC,0xDC,0x6C,0x0C,0xCC,0x78}, /* y */
+    {0x00,0x00,0x00,0x00,0x00,0xFC,0x18,0x30,0x60,0xC0,0xFC,0x00,0x00}, /* z */
+    {0x00,0x38,0x60,0x60,0x60,0x30,0xE0,0x30,0x60,0x60,0x60,0x38,0x00}, /* { */
+    {0x00,0x00,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x00,0x00}, /* | */
+    {0x00,0xE0,0x30,0x30,0x30,0x60,0x38,0x60,0x30,0x30,0x30,0xE0,0x00}, /* } */
+    {0x00,0x00,0x68,0xF8,0x90,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* ~ */
+};
 
-static int g_theme = 0;
 
-/* ------------------------------------------------------------------ */
-/* Tracks                                                              */
-/* ------------------------------------------------------------------ */
-
+/* ---------------------------------------------------------------- state */
 typedef struct {
-    char path[300];
-    char disp[64];
+    char file[160];                /* real file name (as on the card)   */
+    char title[96];                /* display name: ascii, no extension */
 } Track;
 
 static Track g_tracks[MAX_TRACKS];
-static int g_count = 0;
+static int   g_ntracks = 0;
 
-static const char *RU[32] = {
-    "A","B","V","G","D","E","Zh","Z","I","Y","K","L","M","N","O","P",
-    "R","S","T","U","F","Kh","Ts","Ch","Sh","Sch","","Y","'","E","Yu","Ya"
+static char  g_music_dir[32] = "ms0:/MUSIC";
+static char  g_app_dir[160]  = "ms0:/PSP/GAME/SoftClub/";
+
+static volatile int g_running   = 1;   /* cleared by the HOME-menu exit callback */
+static volatile int g_quit      = 0;   /* tells the audio thread to finish        */
+static volatile int g_state     = ST_STOP;
+static volatile int g_cur       = -1;  /* track that is loaded / playing          */
+static volatile int g_elapsed   = 0;   /* seconds                                 */
+static volatile int g_total     = 0;   /* seconds (estimated from bitrate)        */
+static volatile int g_bitrate   = 0;   /* kbps                                    */
+static volatile int g_rate      = 0;   /* Hz                                      */
+static volatile int g_volume    = 80;  /* 0..100                                  */
+static volatile int g_pause     = 0;
+static volatile int g_req_track = -1;  /* requested track, -1 = stop              */
+static volatile int g_req_seq   = 0;   /* incremented on every request            */
+
+static int         g_theme   = 0;
+static const char *g_err     = NULL;
+static int         g_audio_ok = 0;
+
+static unsigned char g_mp3buf[MP3_BUF_SIZE + 2048] __attribute__((aligned(64)));
+static unsigned char g_pcmbuf[PCM_BUF_SIZE]        __attribute__((aligned(64)));
+static short         g_acc[2 * 2304]               __attribute__((aligned(64)));
+
+/* ------------------------------------------------------------- graphics */
+static uint32_t  g_bg [SB * SH] __attribute__((aligned(64)));   /* pre-rendered background */
+static uint32_t  g_scr[SB * SH] __attribute__((aligned(64)));   /* frame being composed    */
+static uint32_t *g_dst = g_bg;                                  /* current draw target     */
+
+static void     *g_vram_phys[2];
+static uint32_t *g_vram[2];
+static int       g_back = 1;
+
+#define RGB(r, g, b) ((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16) | 0xFF000000u)
+
+typedef struct {
+    const char *name;
+    uint32_t body_top, body_bot;       /* page background gradient      */
+    uint32_t hero_top, hero_bot;       /* big picture area gradient     */
+    uint32_t glow1, glow2, glow3;      /* soft blurry blobs             */
+    uint32_t line;                     /* white-ish frame lines         */
+    uint32_t head;                     /* header cells                  */
+    uint32_t bar, bar_text;            /* label bars                    */
+    uint32_t text;                     /* list text                     */
+    uint32_t sel_bg, sel_text;         /* selected row                  */
+    uint32_t accent;                   /* progress / volume fill        */
+    uint32_t hero_text, hero_shadow;   /* text over the picture         */
+    uint32_t well;                     /* recessed progress background  */
+} Theme;
+
+static const Theme THEMES[N_THEMES] = {
+    { "SOFT CLUB",
+      RGB(206,204,214), RGB(184,182,198), RGB(228,243,247), RGB(86,166,188),
+      RGB(88,138,232),  RGB(255,255,255), RGB(120,212,212),
+      RGB(255,255,255), RGB(166,164,182), RGB(98,106,126), RGB(255,255,255),
+      RGB(44,48,64),    RGB(98,106,126),  RGB(255,255,255), RGB(112,204,218),
+      RGB(255,255,255), RGB(38,92,120),   RGB(116,122,146) },
+    { "GEN X",
+      RGB(204,206,208), RGB(168,172,176), RGB(234,238,232), RGB(116,148,138),
+      RGB(206,228,60),  RGB(255,255,255), RGB(92,150,190),
+      RGB(255,255,255), RGB(148,152,156), RGB(58,64,70),    RGB(236,244,255),
+      RGB(30,34,38),    RGB(58,64,70),    RGB(214,232,60),  RGB(206,226,48),
+      RGB(255,255,255), RGB(46,70,64),    RGB(92,98,104) },
+    { "MIDNIGHT LOUNGE",
+      RGB(54,58,88),    RGB(28,30,52),    RGB(14,18,48),    RGB(60,84,156),
+      RGB(196,80,200),  RGB(80,160,255),  RGB(40,220,220),
+      RGB(150,160,214), RGB(66,72,110),   RGB(20,22,42),    RGB(190,206,255),
+      RGB(200,210,240), RGB(92,112,200),  RGB(255,255,255), RGB(110,200,255),
+      RGB(240,246,255), RGB(10,12,32),    RGB(12,14,30) },
+    { "FROSTED SILVER",
+      RGB(238,242,246), RGB(208,214,222), RGB(250,252,254), RGB(172,188,208),
+      RGB(150,182,238), RGB(255,255,255), RGB(200,210,232),
+      RGB(255,255,255), RGB(188,196,208), RGB(116,126,142), RGB(255,255,255),
+      RGB(50,58,72),    RGB(116,126,142), RGB(255,255,255), RGB(84,128,205),
+      RGB(58,70,98),    RGB(255,255,255), RGB(150,160,176) },
+    { "PEACH FIZZ",
+      RGB(247,226,216), RGB(232,200,194), RGB(255,238,222), RGB(250,158,150),
+      RGB(255,198,112), RGB(255,122,172), RGB(255,255,255),
+      RGB(255,255,255), RGB(224,172,172), RGB(170,102,112), RGB(255,255,255),
+      RGB(84,48,56),    RGB(170,102,112), RGB(255,255,255), RGB(255,138,108),
+      RGB(255,255,255), RGB(170,80,90),   RGB(190,132,132) },
 };
 
-static void put_str(char *out, int *n, int max, const char *s, int lower)
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static uint32_t mix(uint32_t a, uint32_t b, int t)          /* t = 0..256 */
 {
-    while (*s && *n < max - 1) {
-        out[(*n)++] = lower ? (char)tolower((unsigned char)*s) : *s;
-        s++;
+    int ar = a & 255, ag = (a >> 8) & 255, ab = (a >> 16) & 255;
+    int br = b & 255, bg = (b >> 8) & 255, bb = (b >> 16) & 255;
+    int r  = ar + (br - ar) * t / 256;
+    int g  = ag + (bg - ag) * t / 256;
+    int bl = ab + (bb - ab) * t / 256;
+    return RGB(r, g, bl);
+}
+
+static void rect(int x, int y, int w, int h, uint32_t c)
+{
+    int x0 = clampi(x, 0, SW), x1 = clampi(x + w, 0, SW);
+    int y0 = clampi(y, 0, SH), y1 = clampi(y + h, 0, SH);
+    for (int yy = y0; yy < y1; yy++) {
+        uint32_t *p = g_dst + yy * SB;
+        for (int xx = x0; xx < x1; xx++) p[xx] = c;
     }
 }
 
-/* Debug font has no Cyrillic, so transliterate UTF-8 Russian to Latin */
-static void make_display(const char *name, char *out, int max)
+static void rect_a(int x, int y, int w, int h, uint32_t c, int a)
 {
-    char tmp[300];
-    strncpy(tmp, name, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = 0;
-    char *dot = strrchr(tmp, '.');
-    if (dot) *dot = 0;
+    int x0 = clampi(x, 0, SW), x1 = clampi(x + w, 0, SW);
+    int y0 = clampi(y, 0, SH), y1 = clampi(y + h, 0, SH);
+    for (int yy = y0; yy < y1; yy++) {
+        uint32_t *p = g_dst + yy * SB;
+        for (int xx = x0; xx < x1; xx++) p[xx] = mix(p[xx], c, a);
+    }
+}
 
-    int n = 0;
-    const unsigned char *p = (const unsigned char *)tmp;
-    while (*p && n < max - 1) {
-        unsigned char c = *p;
-        if (c < 0x80) {
-            if (c >= 32) out[n++] = (char)c;
-            p++;
-        } else if ((c == 0xD0 || c == 0xD1) && p[1]) {
-            unsigned char c2 = p[1];
-            int idx = -1, up = 0;
-            if (c == 0xD0) {
-                if (c2 >= 0x90 && c2 <= 0xAF)      { idx = c2 - 0x90; up = 1; }
-                else if (c2 >= 0xB0 && c2 <= 0xBF) { idx = c2 - 0xB0; }
-                else if (c2 == 0x81)               { put_str(out, &n, max, "Yo", 0); p += 2; continue; }
-            } else {
-                if (c2 >= 0x80 && c2 <= 0x8F)      { idx = c2 - 0x80 + 16; }
-                else if (c2 == 0x91)               { put_str(out, &n, max, "yo", 0); p += 2; continue; }
-            }
-            if (idx >= 0) {
-                if (up) {
-                    put_str(out, &n, max, RU[idx], 0);
-                } else {
-                    put_str(out, &n, max, RU[idx], 1);
-                }
-            } else {
-                out[n++] = '?';
-            }
-            p += 2;
-        } else {
-            int len = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : 2;
-            out[n++] = '?';
-            for (int i = 0; i < len && *p; i++) p++;
+static void vgrad(int x, int y, int w, int h, uint32_t top, uint32_t bot)
+{
+    for (int i = 0; i < h; i++)
+        rect(x, y + i, w, 1, mix(top, bot, h > 1 ? i * 256 / (h - 1) : 0));
+}
+
+static void glow(int cx, int cy, int rx, int ry, uint32_t c, int amax)
+{
+    for (int y = cy - ry; y <= cy + ry; y++) {
+        if (y < 0 || y >= SH) continue;
+        int dy = (y - cy) * 256 / ry;
+        for (int x = cx - rx; x <= cx + rx; x++) {
+            if (x < 0 || x >= SW) continue;
+            int dx = (x - cx) * 256 / rx;
+            int d2 = (dx * dx + dy * dy) >> 8;
+            if (d2 >= 256) continue;
+            int f  = 256 - d2;
+            int a  = ((f * f) >> 8) * amax >> 8;
+            if (a <= 0) continue;
+            uint32_t *p = &g_dst[y * SB + x];
+            *p = mix(*p, c, a);
         }
     }
-    out[n] = 0;
+}
+
+/* rounded rectangles ---------------------------------------------------- */
+static int isqrt_i(int v) { int r = 0; while ((r + 1) * (r + 1) <= v) r++; return r; }
+
+static int rr_ins(int h, int r, int i)       /* horizontal inset of row i */
+{
+    int d;
+    if (r <= 0) return 0;
+    if (i < r) d = i;
+    else if (i >= h - r) d = h - 1 - i;
+    else return 0;
+    return r - isqrt_i(r * r - (r - d) * (r - d));
+}
+
+static void rrect_a(int x, int y, int w, int h, int r, uint32_t c, int a)
+{
+    for (int i = 0; i < h; i++) {
+        int o = rr_ins(h, r, i);
+        rect_a(x + o, y + i, w - 2 * o, 1, c, a);
+    }
+}
+
+static void rring_a(int x, int y, int w, int h, int r, uint32_t c, int a)
+{
+    for (int i = 0; i < h; i++) {
+        int o0 = rr_ins(h, r, i), o1 = w - o0;
+        if (i == 0 || i == h - 1 || w < 3) {
+            rect_a(x + o0, y + i, o1 - o0, 1, c, a);
+            continue;
+        }
+        int ri = r > 0 ? r - 1 : 0;
+        int i0 = 1 + rr_ins(h - 2, ri, i - 1);
+        int i1 = (w - 1) - rr_ins(h - 2, ri, i - 1);
+        if (i0 < o0) i0 = o0;
+        if (i1 > o1) i1 = o1;
+        rect_a(x + o0, y + i, i0 - o0, 1, c, a);
+        rect_a(x + i1, y + i, o1 - i1, 1, c, a);
+    }
+}
+
+/* text ------------------------------------------------------------------ */
+typedef struct { const unsigned char *data; int w, h; } Font;
+static const Font F_S = { &FONT_S[0][0], 6, 10 };
+static const Font F_B = { &FONT_B[0][0], 6, 13 };
+
+static int text_w(const Font *f, const char *s, int scale) { return (int)strlen(s) * f->w * scale; }
+
+static void text_clip(const Font *f, int x, int y, const char *s, uint32_t c,
+                      int scale, int cx0, int cx1)
+{
+    if (cx0 < 0) cx0 = 0;
+    if (cx1 > SW) cx1 = SW;
+    for (; *s; s++, x += f->w * scale) {
+        int ch = (unsigned char)*s;
+        if (ch < 32 || ch > 126) ch = '?';
+        if (x + f->w * scale <= cx0 || x >= cx1) continue;
+        const unsigned char *g = f->data + (ch - 32) * f->h;
+        for (int ry = 0; ry < f->h; ry++) {
+            unsigned bits = g[ry];
+            if (!bits) continue;
+            for (int rx = 0; rx < f->w; rx++) {
+                if (!(bits & (0x80u >> rx))) continue;
+                for (int sy = 0; sy < scale; sy++) {
+                    int yy = y + ry * scale + sy;
+                    if ((unsigned)yy >= SH) continue;
+                    for (int sx = 0; sx < scale; sx++) {
+                        int xx = x + rx * scale + sx;
+                        if (xx >= cx0 && xx < cx1) g_dst[yy * SB + xx] = c;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void txt(const Font *f, int x, int y, const char *s, uint32_t c)
+{
+    text_clip(f, x, y, s, c, 1, 0, SW);
+}
+
+static void txt_bold(const Font *f, int x, int y, const char *s, uint32_t c)
+{
+    text_clip(f, x, y, s, c, 1, 0, SW);
+    text_clip(f, x + 1, y, s, c, 1, 0, SW);
+}
+
+static void txt_right(const Font *f, int right, int y, const char *s, uint32_t c)
+{
+    txt_bold(f, right - text_w(f, s, 1) - 1, y, s, c);
+}
+
+static void txt_shadow(const Font *f, int x, int y, const char *s, uint32_t c, uint32_t sh,
+                       int scale, int cx0, int cx1)
+{
+    int off = scale >= 2 ? 2 : 1;
+    text_clip(f, x + off, y + off, s, sh, scale, cx0, cx1);
+    text_clip(f, x, y, s, c, scale, cx0, cx1);
+}
+
+/* -------------------------------------------------------------- layout */
+#define HDR_Y    8
+#define HDR_H    18
+#define HERO_X   8
+#define HERO_Y   29
+#define HERO_W   463
+#define HERO_H   108
+#define LOW_Y    141
+#define LOW_H    125
+#define LIST_X   8
+#define LIST_W   222
+#define LROW_Y   155
+#define LROW_H   12
+#define RP_X     234
+#define RP_W     237
+#define PROG_X   242
+#define PROG_Y   160
+#define PROG_W   220
+#define PROG_H   10
+#define VOL_Y    194
+#define VOL_CELLS 20
+
+static void render_bg(const Theme *t)
+{
+    char buf[64];
+    g_dst = g_bg;
+
+    vgrad(0, 0, SW, SH, t->body_top, t->body_bot);
+
+    /* white double frame around everything */
+    rect_a(3, 3, 474, 2, t->line, 235);
+    rect_a(3, 267, 474, 2, t->line, 235);
+    rect_a(3, 5, 2, 262, t->line, 235);
+    rect_a(475, 5, 2, 262, t->line, 235);
+
+    /* header cells */
+    rrect_a(8, HDR_Y, 268, HDR_H, 3, t->head, 255);
+    rring_a(8, HDR_Y, 268, HDR_H, 3, t->line, 230);
+    rrect_a(280, HDR_Y, 191, HDR_H, 3, t->head, 255);
+    rring_a(280, HDR_Y, 191, HDR_H, 3, t->line, 230);
+    txt_bold(&F_B, 16, HDR_Y + 3, "SOFT//CLUB", t->bar_text);
+    txt(&F_S, 16 + 11 * 6 + 8, HDR_Y + 5, "mp3 player // psp", t->bar_text);
+    snprintf(buf, sizeof buf, "%s  %d FILES", g_music_dir, g_ntracks);
+    txt_right(&F_S, 467, HDR_Y + 5, buf, t->bar_text);
+
+    /* hero picture */
+    vgrad(HERO_X, HERO_Y, HERO_W, HERO_H, t->hero_top, t->hero_bot);
+    glow(130,  62, 120, 78, t->glow1, 190);
+    glow(340,  98, 190, 66, t->glow2, 120);
+    glow(430,  44,  96, 58, t->glow3, 130);
+    glow( 60, 122, 110, 40, t->glow3,  90);
+    glow(250,  40,  70, 40, t->glow2,  80);
+    for (int k = 0; k < 7; k++)                       /* faint horizon / water lines */
+        rect_a(HERO_X, 98 + k * 5 + (k * k) / 3, HERO_W, 1, t->glow2, 120 - k * 14);
+    rring_a(HERO_X, HERO_Y, HERO_W, HERO_H, 2, t->line, 235);
+
+    /* playlist panel */
+    rrect_a(LIST_X, LOW_Y, LIST_W, LOW_H, 4, t->line, 70);
+    rring_a(LIST_X, LOW_Y, LIST_W, LOW_H, 4, t->line, 230);
+    rect(LIST_X + 1, LOW_Y + 1, LIST_W - 2, 13, t->bar);
+    txt_bold(&F_S, LIST_X + 6, LOW_Y + 3, "PLAYLIST", t->bar_text);
+    for (int r = 0; r < LIST_ROWS; r++)
+        rect_a(LIST_X + 3, LROW_Y + r * LROW_H + LROW_H - 1, LIST_W - 15, 1, t->line, 110);
+
+    /* right panel */
+    rrect_a(RP_X, LOW_Y, RP_W, LOW_H, 4, t->line, 70);
+    rring_a(RP_X, LOW_Y, RP_W, LOW_H, 4, t->line, 230);
+
+    rect(RP_X + 1, LOW_Y + 1, RP_W - 2, 13, t->bar);
+    txt_bold(&F_S, RP_X + 6, LOW_Y + 3, "TIME", t->bar_text);
+    rrect_a(PROG_X - 2, PROG_Y - 2, PROG_W + 4, PROG_H + 4, 3, t->well, 255);
+    rring_a(PROG_X - 2, PROG_Y - 2, PROG_W + 4, PROG_H + 4, 3, t->line, 170);
+
+    rect(RP_X + 1, 177, RP_W - 2, 13, t->bar);
+    txt_bold(&F_S, RP_X + 6, 179, "VOLUME", t->bar_text);
+    for (int i = 0; i < VOL_CELLS; i++)
+        rrect_a(241 + i * 11, VOL_Y, 9, 10, 2, t->well, 255);
+
+    rect(RP_X + 1, 211, RP_W - 2, 13, t->bar);
+    txt_bold(&F_S, RP_X + 6, 213, "THEME", t->bar_text);
+
+    txt(&F_S, RP_X + 8, 229, "X PLAY/PAUSE    [] STOP",     t->text);
+    txt(&F_S, RP_X + 8, 240, "L/R PREV/NEXT   /\\ THEME",   t->text);
+    txt(&F_S, RP_X + 8, 251, "UP/DN LIST      </> VOLUME",  t->text);
+}
+
+/* ------------------------------------------------------------ dynamic UI */
+typedef struct {
+    int state, cur, elapsed, total, bitrate, rate;
+    int vol, theme, sel, top, tick, ntr;
+} UiState;
+
+static void fmt_time(char *out, size_t cap, int s, int known)
+{
+    if (!known) { snprintf(out, cap, "--:--"); return; }
+    snprintf(out, cap, "%02d:%02d", s / 60, s % 60);
+}
+
+static const char *title_for(const UiState *u)
+{
+    if (g_err)           return g_err;
+    if (u->ntr == 0)     return "NO MP3 FILES FOUND";
+    if (u->cur >= 0)     return g_tracks[u->cur].title;
+    return "PRESS X TO PLAY";
+}
+
+static void render_ui(const UiState *u)
+{
+    const Theme *t = &THEMES[u->theme];
+    char buf[96], a[16], b[16];
+
+    memcpy(g_scr, g_bg, sizeof g_scr);
+    g_dst = g_scr;
+
+    /* ---- hero: title (scrolls if long) */
+    const char *title = title_for(u);
+    int tw = text_w(&F_B, title, 2);
+    if (tw <= 447) {
+        txt_shadow(&F_B, 16, 36, title, t->hero_text, t->hero_shadow, 2, 16, 463);
+    } else {
+        int period = tw + 72;
+        int off = (u->tick * 2) % period;
+        txt_shadow(&F_B, 16 - off,          36, title, t->hero_text, t->hero_shadow, 2, 16, 463);
+        txt_shadow(&F_B, 16 - off + period, 36, title, t->hero_text, t->hero_shadow, 2, 16, 463);
+    }
+
+    /* ---- hero: info line */
+    if (u->cur >= 0 && u->ntr > 0 && !g_err) {
+        if (u->bitrate > 0)
+            snprintf(buf, sizeof buf, "TRACK %02d/%02d   %d KBPS   %d.%d KHZ",
+                     u->cur + 1, u->ntr, u->bitrate, u->rate / 1000, (u->rate % 1000) / 100);
+        else
+            snprintf(buf, sizeof buf, "TRACK %02d/%02d", u->cur + 1, u->ntr);
+        txt_shadow(&F_S, 17, 66, buf, t->hero_text, t->hero_shadow, 1, 0, SW);
+    }
+
+    /* ---- hero: big time + state word */
+    fmt_time(a, sizeof a, u->elapsed, u->cur >= 0);
+    fmt_time(b, sizeof b, u->total, u->total > 0);
+    snprintf(buf, sizeof buf, "%s / %s", a, b);
+    txt_shadow(&F_B, 16, 102, buf, t->hero_text, t->hero_shadow, 2, 0, SW);
+
+    const char *word = "//ready";
+    switch (u->state) {
+        case ST_LOAD:  word = "//loading"; break;
+        case ST_PLAY:  word = "//playing"; break;
+        case ST_PAUSE: word = "//paused";  break;
+        case ST_ERROR: word = "//error";   break;
+        default:       word = (u->cur >= 0) ? "//stopped" : "//ready"; break;
+    }
+    txt_shadow(&F_B, 463 - text_w(&F_B, word, 3), 94, word, t->hero_text, t->hero_shadow, 3, 0, SW);
+
+    /* ---- playlist */
+    if (u->ntr == 0) {
+        txt(&F_S, 16, LROW_Y + 4,  "NO MP3 FILES FOUND.", t->text);
+        txt(&F_S, 16, LROW_Y + 18, "COPY YOUR MUSIC TO:", t->text);
+        txt_bold(&F_S, 16, LROW_Y + 32, g_music_dir, t->text);
+    }
+    for (int r = 0; r < LIST_ROWS; r++) {
+        int idx = u->top + r;
+        if (idx >= u->ntr) break;
+        int ry = LROW_Y + r * LROW_H;
+        int is_sel = (idx == u->sel);
+        uint32_t col = t->text;
+        if (is_sel) {
+            rect(LIST_X + 3, ry, LIST_W - 15, LROW_H - 1, t->sel_bg);
+            col = t->sel_text;
+        }
+        char mark = ' ';
+        if (idx == u->cur) mark = (u->state == ST_PAUSE) ? '=' : (u->state == ST_STOP ? ' ' : '>');
+        char name[40];
+        const char *src = g_tracks[idx].title;
+        if (strlen(src) > 30) { snprintf(name, sizeof name, "%.28s..", src); }
+        else                  { snprintf(name, sizeof name, "%.30s", src); }
+        snprintf(buf, sizeof buf, "%c%02d %s", mark, idx + 1, name);
+        txt(&F_S, LIST_X + 7, ry + 1, buf, col);
+        if (mark != ' ') {
+            char m[2] = { mark, 0 };
+            txt(&F_S, LIST_X + 7, ry + 1, m, is_sel ? col : t->accent);
+        }
+    }
+    if (u->ntr > LIST_ROWS) {                       /* scrollbar */
+        int th = clampi(106 * LIST_ROWS / u->ntr, 10, 106);
+        int ty = 155 + (106 - th) * u->top / (u->ntr - LIST_ROWS);
+        rect_a(LIST_X + LIST_W - 9, 155, 4, 106, t->line, 100);
+        rect(LIST_X + LIST_W - 9, ty, 4, th, t->bar);
+    }
+
+    /* ---- right panel: time / progress */
+    int pct = (u->total > 0) ? clampi(u->elapsed * 100 / u->total, 0, 100) : 0;
+    if (u->total > 0) snprintf(buf, sizeof buf, "%d%%", pct); else snprintf(buf, sizeof buf, "--%%");
+    txt_right(&F_S, RP_X + RP_W - 6, LOW_Y + 3, buf, t->bar_text);
+    if (u->total > 0) {
+        int fw = PROG_W * pct / 100;
+        rect(PROG_X, PROG_Y, fw, PROG_H, t->accent);
+        rect_a(PROG_X, PROG_Y, fw, 4, t->line, 90);
+    }
+
+    /* ---- volume */
+    snprintf(buf, sizeof buf, "%d%%", u->vol);
+    txt_right(&F_S, RP_X + RP_W - 6, 179, buf, t->bar_text);
+    int cells = (u->vol * VOL_CELLS + 50) / 100;
+    for (int i = 0; i < cells; i++) {
+        rrect_a(241 + i * 11, VOL_Y, 9, 10, 2, t->accent, 255);
+        rect_a(241 + i * 11 + 1, VOL_Y + 1, 7, 3, t->line, 90);
+    }
+
+    /* ---- theme */
+    snprintf(buf, sizeof buf, "%s  %d/%d", t->name, u->theme + 1, N_THEMES);
+    txt_right(&F_S, RP_X + RP_W - 6, 213, buf, t->bar_text);
+}
+
+static void init_display(void)
+{
+    g_vram_phys[0] = sceGeEdramGetAddr();
+    g_vram_phys[1] = (void *)((uintptr_t)g_vram_phys[0] + FRAME_BYTES);
+    g_vram[0] = (uint32_t *)((uintptr_t)g_vram_phys[0] | 0x40000000);
+    g_vram[1] = (uint32_t *)((uintptr_t)g_vram_phys[1] | 0x40000000);
+    memset(g_vram[0], 0, FRAME_BYTES);
+    memset(g_vram[1], 0, FRAME_BYTES);
+    sceDisplaySetMode(0, SW, SH);
+    sceDisplaySetFrameBuf(g_vram_phys[0], SB, PSP_DISPLAY_PIXEL_FORMAT_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
+}
+
+static void present(void)
+{
+    memcpy(g_vram[g_back], g_scr, FRAME_BYTES);
+    sceDisplaySetFrameBuf(g_vram_phys[g_back], SB, PSP_DISPLAY_PIXEL_FORMAT_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
+    g_back ^= 1;
+}
+
+/* --------------------------------------------------- file names -> ascii */
+static const char *const CYR[32] = {
+    "a","b","v","g","d","e","zh","z","i","y","k","l","m","n","o","p",
+    "r","s","t","u","f","kh","ts","ch","sh","shch","","y","","e","yu","ya"
+};
+
+static void build_title(const char *src, char *dst, size_t cap)
+{
+    const unsigned char *s = (const unsigned char *)src;
+    size_t n = strlen(src), o = 0, i = 0;
+    if (n > 4) n -= 4;                                   /* drop ".mp3" */
+
+    while (i < n && o + 6 < cap) {
+        unsigned c = s[i], cp, len;
+        if (c < 0x80)                          { cp = c; len = 1; }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < n) { cp = ((c & 0x1F) << 6) | (s[i + 1] & 0x3F); len = 2; }
+        else if ((c & 0xF0) == 0xE0 && i + 2 < n) { cp = ((c & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F); len = 3; }
+        else if ((c & 0xF8) == 0xF0 && i + 3 < n) { cp = 0xFFFF; len = 4; }
+        else                                   { cp = 0xFFFF; len = 1; }
+        i += len;
+
+        char tmp[8];
+        const char *rep = "?";
+        if (cp < 0x80) {
+            tmp[0] = (cp >= 32 && cp < 127) ? (char)cp : '_';
+            tmp[1] = 0;
+            rep = tmp;
+        } else if (cp >= 0x410 && cp <= 0x42F) {         /* А-Я */
+            snprintf(tmp, sizeof tmp, "%s", CYR[cp - 0x410]);
+            if (tmp[0] >= 'a' && tmp[0] <= 'z') tmp[0] = (char)(tmp[0] - 32);
+            rep = tmp;
+        } else if (cp >= 0x430 && cp <= 0x44F) {         /* а-я */
+            rep = CYR[cp - 0x430];
+        } else switch (cp) {
+            case 0x401: rep = "Yo"; break;   case 0x451: rep = "yo"; break;
+            case 0x406: rep = "I";  break;   case 0x456: rep = "i";  break;
+            case 0x407: rep = "Yi"; break;   case 0x457: rep = "yi"; break;
+            case 0x404: rep = "Ye"; break;   case 0x454: rep = "ye"; break;
+            case 0x490: rep = "G";  break;   case 0x491: rep = "g";  break;
+            case 0x2116: rep = "No"; break;
+            case 0xA0:   rep = " "; break;
+            case 0x2018: case 0x2019: rep = "'"; break;
+            case 0x201C: case 0x201D: rep = "\""; break;
+            case 0x2013: case 0x2014: rep = "-"; break;
+            case 0x2026: rep = "..."; break;
+            default: rep = "?"; break;
+        }
+        while (*rep && o + 1 < cap) dst[o++] = *rep++;
+    }
+    dst[o] = 0;
 }
 
 static int cmp_tracks(const void *a, const void *b)
 {
-    return strcasecmp(((const Track *)a)->path, ((const Track *)b)->path);
+    return strcasecmp(((const Track *)a)->file, ((const Track *)b)->file);
 }
 
-static void scan_tracks(void)
+static void scan_music(void)
 {
-    SceUID d = sceIoDopen(MUSIC_DIR);
+    SceUID d = sceIoDopen(g_music_dir);
     if (d < 0) return;
-
     SceIoDirent e;
-    memset(&e, 0, sizeof(e));
-    while (sceIoDread(d, &e) > 0 && g_count < MAX_TRACKS) {
-        if (!FIO_S_ISDIR(e.d_stat.st_mode)) {
-            const char *dot = strrchr(e.d_name, '.');
-            if (dot && strcasecmp(dot, ".mp3") == 0) {
-                Track *t = &g_tracks[g_count++];
-                snprintf(t->path, sizeof(t->path), "%s/%s", MUSIC_DIR, e.d_name);
-                make_display(e.d_name, t->disp, sizeof(t->disp));
-            }
+    memset(&e, 0, sizeof e);
+    while (g_ntracks < MAX_TRACKS && sceIoDread(d, &e) > 0) {
+        size_t l = strlen(e.d_name);
+        if (!FIO_S_ISDIR(e.d_stat.st_mode) && l > 4 && l < sizeof g_tracks[0].file &&
+            strcasecmp(e.d_name + l - 4, ".mp3") == 0) {
+            Track *t = &g_tracks[g_ntracks++];
+            snprintf(t->file, sizeof t->file, "%.159s", e.d_name);
+            build_title(e.d_name, t->title, sizeof t->title);
         }
-        memset(&e, 0, sizeof(e));
+        memset(&e, 0, sizeof e);
     }
     sceIoDclose(d);
-    qsort(g_tracks, g_count, sizeof(Track), cmp_tracks);
+    qsort(g_tracks, g_ntracks, sizeof g_tracks[0], cmp_tracks);
 }
 
-/* ------------------------------------------------------------------ */
-/* Drawing                                                             */
-/* ------------------------------------------------------------------ */
+/* -------------------------------------------------------------- settings */
+static void cfg_path(char *out, size_t cap) { snprintf(out, cap, "%ssettings.cfg", g_app_dir); }
 
-static u32 *vram;
-static u32 g_bg[STRIDE * SCR_H];   /* pre-rendered background + panels */
-static u32 g_seed = 12345;
-
-static u32 rnd(void)
+static void cfg_load(void)
 {
-    g_seed = g_seed * 1664525u + 1013904223u;
-    return g_seed >> 8;
-}
-
-static inline u32 blend(u32 d, u32 s, int a)
-{
-    int dr = d & 255, dg = (d >> 8) & 255, db = (d >> 16) & 255;
-    int sr = s & 255, sg = (s >> 8) & 255, sb = (s >> 16) & 255;
-    dr += (sr - dr) * a / 255;
-    dg += (sg - dg) * a / 255;
-    db += (sb - db) * a / 255;
-    return 0xFF000000u | ((u32)db << 16) | ((u32)dg << 8) | (u32)dr;
-}
-
-static void rrect(u32 *b, int x, int y, int w, int h, int r, u32 c, int a)
-{
-    if (r * 2 > h) r = h / 2;
-    if (r * 2 > w) r = w / 2;
-    for (int row = 0; row < h; row++) {
-        int py = y + row;
-        if (py < 0 || py >= SCR_H) continue;
-        int dy = 0;
-        if (row < r)            dy = r - row;
-        else if (row >= h - r)  dy = row - (h - r) + 1;
-        int inset = 0;
-        if (dy > 0) {
-            float d = (float)dy - 0.5f;
-            inset = (int)((float)r - sqrtf((float)(r * r) - d * d) + 0.5f);
-        }
-        int x0 = x + inset, x1 = x + w - inset;
-        if (x0 < 0) x0 = 0;
-        if (x1 > SCR_W) x1 = SCR_W;
-        u32 *line = b + py * STRIDE;
-        if (a >= 255) {
-            for (int px = x0; px < x1; px++) line[px] = c;
-        } else {
-            for (int px = x0; px < x1; px++) line[px] = blend(line[px], c, a);
-        }
+    char path[200], buf[32];
+    cfg_path(path, sizeof path);
+    SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
+    if (fd < 0) return;
+    memset(buf, 0, sizeof buf);
+    sceIoRead(fd, buf, sizeof buf - 1);
+    sceIoClose(fd);
+    int th = 0, vol = 80;
+    if (sscanf(buf, "%d %d", &th, &vol) == 2) {
+        g_theme  = clampi(th, 0, N_THEMES - 1);
+        g_volume = clampi(vol, 0, 100);
     }
 }
 
-static void bubble(u32 *b, int cx, int cy, int r, u32 c, int a)
+static void cfg_save(void)
 {
-    for (int y = cy - r; y <= cy + r; y++) {
-        if (y < 0 || y >= SCR_H) continue;
-        for (int x = cx - r; x <= cx + r; x++) {
-            if (x < 0 || x >= SCR_W) continue;
-            int dx = x - cx, dy = y - cy;
-            int d2 = dx * dx + dy * dy;
-            if (d2 > r * r) continue;
-            int rim = (d2 >= (r - 2) * (r - 2));
-            /* soft shine in upper-left */
-            int shine = (dx < 0 && dy < 0 && d2 < (r * r) / 3);
-            int aa = a + (rim ? a : 0) + (shine ? a / 2 : 0);
-            if (aa > 255) aa = 255;
-            b[y * STRIDE + x] = blend(b[y * STRIDE + x], c, aa);
-        }
+    char path[200], buf[32];
+    cfg_path(path, sizeof path);
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0) return;
+    int n = snprintf(buf, sizeof buf, "%d %d\n", g_theme, (int)g_volume);
+    sceIoWrite(fd, buf, n);
+    sceIoClose(fd);
+}
+
+static void init_paths(const char *argv0)
+{
+    if (!argv0) return;
+    const char *colon = strchr(argv0, ':');
+    if (colon && (colon - argv0) < 8) {
+        snprintf(g_music_dir, sizeof g_music_dir, "%.*s/MUSIC", (int)(colon - argv0 + 1), argv0);
+    }
+    const char *slash = strrchr(argv0, '/');
+    if (slash && (size_t)(slash - argv0 + 1) < sizeof g_app_dir) {
+        snprintf(g_app_dir, sizeof g_app_dir, "%.*s", (int)(slash - argv0 + 1), argv0);
     }
 }
 
-static void render_theme(void)
+/* ======================================================================
+ *  AUDIO THREAD
+ * ====================================================================== */
+static int vol_hw(int v) { return v * v * 0x8000 / 10000; }
+
+/* read the next chunk of the file into the decoder's stream buffer */
+static int fill_stream(SceUID fd, SceInt32 h)
 {
-    const Theme *t = &THEMES[g_theme];
+    SceUChar8 *dst = NULL;
+    SceInt32 towrite = 0, srcpos = 0;
 
-    /* vertical gradient */
-    int tr = t->bg_top & 255, tg = (t->bg_top >> 8) & 255, tb = (t->bg_top >> 16) & 255;
-    int br = t->bg_bot & 255, bg = (t->bg_bot >> 8) & 255, bb = (t->bg_bot >> 16) & 255;
-    for (int y = 0; y < SCR_H; y++) {
-        int r = tr + (br - tr) * y / (SCR_H - 1);
-        int g = tg + (bg - tg) * y / (SCR_H - 1);
-        int b = tb + (bb - tb) * y / (SCR_H - 1);
-        u32 col = C(r, g, b);
-        for (int x = 0; x < STRIDE; x++) g_bg[y * STRIDE + x] = col;
+    if (sceMp3GetInfoToAddStreamData(h, &dst, &towrite, &srcpos) < 0) return -1;
+    if (towrite <= 0) return 0;
+    if (sceIoLseek32(fd, (int)srcpos, PSP_SEEK_SET) < 0) return -1;
+    int n = sceIoRead(fd, dst, (SceSize)towrite);
+    if (n < 0) return -1;
+    if (n == 0) return 0;                                 /* end of file */
+    if (sceMp3NotifyAddStreamData(h, n) < 0) return -1;
+    return n;
+}
+
+/* find where the MP3 audio really starts / ends (skip ID3v2 / ID3v1) */
+static void find_stream(SceUID fd, int size, int *start, int *end)
+{
+    unsigned char hdr[10], tag[3];
+    *start = 0;
+    *end = size;
+
+    sceIoLseek32(fd, 0, PSP_SEEK_SET);
+    if (sceIoRead(fd, hdr, 10) == 10 && memcmp(hdr, "ID3", 3) == 0) {
+        int sz = ((hdr[6] & 0x7F) << 21) | ((hdr[7] & 0x7F) << 14) | ((hdr[8] & 0x7F) << 7) | (hdr[9] & 0x7F);
+        *start = 10 + sz + ((hdr[5] & 0x10) ? 10 : 0);
     }
-
-    /* bubbles */
-    g_seed = 777;
-    for (int i = 0; i < t->bubbles; i++) {
-        int cx = rnd() % SCR_W;
-        int cy = rnd() % SCR_H;
-        int r  = 14 + rnd() % 34;
-        bubble(g_bg, cx, cy, r, t->bubble, 28);
+    if (size > 128) {
+        sceIoLseek32(fd, size - 128, PSP_SEEK_SET);
+        if (sceIoRead(fd, tag, 3) == 3 && memcmp(tag, "TAG", 3) == 0) *end = size - 128;
     }
+    if (*start >= *end) { *start = 0; return; }
 
-    /* film grain */
-    if (t->grain > 0) {
-        int gr = t->grain;
-        for (int y = 0; y < SCR_H; y++) {
-            for (int x = 0; x < SCR_W; x++) {
-                u32 p = g_bg[y * STRIDE + x];
-                int n = (int)(rnd() % (2 * gr + 1)) - gr;
-                int r = (p & 255) + n, g = ((p >> 8) & 255) + n, b = ((p >> 16) & 255) + n;
-                if (r < 0) r = 0; if (r > 255) r = 255;
-                if (g < 0) g = 0; if (g > 255) g = 255;
-                if (b < 0) b = 0; if (b > 255) b = 255;
-                g_bg[y * STRIDE + x] = C(r, g, b);
-            }
+    /* look for the first real frame header, tolerate padding after the tag */
+    static unsigned char probe[4096];
+    sceIoLseek32(fd, *start, PSP_SEEK_SET);
+    int n = sceIoRead(fd, probe, sizeof probe);
+    for (int i = 0; i + 4 <= n; i++) {
+        if (probe[i] == 0xFF && (probe[i + 1] & 0xE0) == 0xE0 &&
+            (probe[i + 1] & 0x18) != 0x08 && (probe[i + 1] & 0x06) != 0x00 &&
+            (probe[i + 2] & 0xF0) != 0xF0 && (probe[i + 2] & 0x0C) != 0x0C) {
+            *start += i;
+            break;
         }
     }
-
-    /* CRT scanlines */
-    if (t->scan) {
-        for (int y = 0; y < SCR_H; y += 2)
-            for (int x = 0; x < SCR_W; x++)
-                g_bg[y * STRIDE + x] = blend(g_bg[y * STRIDE + x], C(0,0,0), 36);
-    }
-
-    /* glass panels: now playing + list */
-    rrect(g_bg, 10, 20, 460, 76, 10, t->edge, 120);
-    rrect(g_bg, 11, 21, 458, 74, 9, t->panel, t->panel_a);
-    rrect(g_bg, 10, 102, 460, 144, 10, t->edge, 120);
-    rrect(g_bg, 11, 103, 458, 142, 9, t->panel, t->panel_a);
-
-    if (t->gloss) {
-        rrect(g_bg, 16, 24, 448, 9, 4, C(255,255,255), 45);
-        rrect(g_bg, 16, 106, 448, 9, 4, C(255,255,255), 30);
-    }
 }
 
-static void text(int x, int y, u32 col, const char *s)
+static int play_track(int idx, int *seen)
 {
-    while (*s) {
-        pspDebugScreenPutChar(x, y, col, (unsigned char)*s++);
-        x += 8;
-    }
-}
+    int result = PR_ERROR;
+    SceUID fd = -1;
+    SceInt32 h = -1;
+    int src_open = 0, decoded_any = 0, acc_n = 0;
+    char path[320];
 
-static void text_bold(int x, int y, u32 col, const char *s)
-{
-    text(x, y, col, s);
-    text(x + 1, y, col, s);
-}
+    snprintf(path, sizeof path, "%s/%s", g_music_dir, g_tracks[idx].file);
 
-static void text_clip(int x, int y, u32 col, const char *s, int maxc, int bold)
-{
-    char buf[80];
-    if (maxc > 78) maxc = 78;
-    strncpy(buf, s, maxc);
-    buf[maxc] = 0;
-    if (bold) text_bold(x, y, col, buf); else text(x, y, col, buf);
-}
+    g_cur = idx;
+    g_elapsed = 0; g_total = 0; g_bitrate = 0; g_rate = 0;
+    g_pause = 0;
+    g_state = ST_LOAD;
 
-static void fmt_time(char *out, int ms)
-{
-    int s = ms / 1000;
-    sprintf(out, "%02d:%02d", s / 60, s % 60);
-}
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
+    if (fd < 0) goto done;
+    int size = sceIoLseek32(fd, 0, PSP_SEEK_END);
+    if (size <= 0) goto done;
 
-/* ------------------------------------------------------------------ */
-/* Audio (hardware MP3 decoder, runs in its own thread)                */
-/* ------------------------------------------------------------------ */
-
-static volatile int g_load_idx = -1;   /* main -> audio: load this track  */
-static volatile int g_playing  = 0;
-static volatile int g_ended    = 0;    /* audio -> main: track finished   */
-static volatile int g_err      = 0;
-static volatile int g_pos_ms   = 0;
-static volatile int g_dur_ms   = 0;
-static volatile int g_volume   = 14;   /* 0..20 */
-
-typedef struct {
-    int fd, h, src;
-    int chans, rate, maxs;
-    int eof;
-    unsigned int frames;
-    int dur_ms;
-} Dec;
-
-static unsigned char mp3Buf[16 * 1024] __attribute__((aligned(64)));
-static unsigned char pcmBuf[16 * 1024] __attribute__((aligned(64)));
-static short outBuf[4608] __attribute__((aligned(64)));
-
-static void dec_close(Dec *d)
-{
-    if (d->src >= 0) { sceAudioSRCChRelease(); d->src = -1; }
-    if (d->h >= 0)   { sceMp3ReleaseMp3Handle(d->h); d->h = -1; }
-    if (d->fd >= 0)  { sceIoClose(d->fd); d->fd = -1; }
-}
-
-static int fill_stream(Dec *d)
-{
-    unsigned char *dst;
-  SceInt32 towrite, srcpos;
-    if (sceMp3GetInfoToAddStreamData(d->h, &dst, &towrite, &srcpos) < 0) return -1;
-    sceIoLseek32(d->fd, srcpos, PSP_SEEK_SET);
-    int r = sceIoRead(d->fd, dst, towrite);
-    if (r <= 0) { d->eof = 1; return 0; }
-    sceMp3NotifyAddStreamData(d->h, r);
-    return r;
-}
-
-static int dec_open(Dec *d, const char *path)
-{
-    d->fd = d->h = d->src = -1;
-    d->eof = 0;
-    d->frames = 0;
-
-    d->fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
-    if (d->fd < 0) return -1;
-
-    int size = (int)sceIoLseek32(d->fd, 0, PSP_SEEK_END);
-    sceIoLseek32(d->fd, 0, PSP_SEEK_SET);
-
-    /* skip ID3v2 tag */
-    int start = 0;
-    unsigned char hdr[10];
-    if (sceIoRead(d->fd, hdr, 10) == 10 && memcmp(hdr, "ID3", 3) == 0) {
-        int tag = ((hdr[6] & 0x7F) << 21) | ((hdr[7] & 0x7F) << 14) |
-                  ((hdr[8] & 0x7F) << 7)  |  (hdr[9] & 0x7F);
-        start = 10 + tag + ((hdr[5] & 0x10) ? 10 : 0);
-    }
-    sceIoLseek32(d->fd, 0, PSP_SEEK_SET);
+    int start, end;
+    find_stream(fd, size, &start, &end);
 
     SceMp3InitArg arg;
-    memset(&arg, 0, sizeof(arg));
+    memset(&arg, 0, sizeof arg);
     arg.mp3StreamStart = start;
-    arg.mp3StreamEnd   = size;
-    arg.mp3Buf         = mp3Buf;
-    arg.mp3BufSize     = sizeof(mp3Buf);
-    arg.pcmBuf         = pcmBuf;
-    arg.pcmBufSize     = sizeof(pcmBuf);
+    arg.mp3StreamEnd   = end;
+    arg.mp3Buf         = g_mp3buf;
+    arg.mp3BufSize     = MP3_BUF_SIZE;
+    arg.pcmBuf         = g_pcmbuf;
+    arg.pcmBufSize     = PCM_BUF_SIZE;
 
-    d->h = sceMp3ReserveMp3Handle(&arg);
-    if (d->h < 0) { dec_close(d); return -1; }
+    h = sceMp3ReserveMp3Handle(&arg);
+    if (h < 0) goto done;
+    if (fill_stream(fd, h) < 0) goto done;
+    if (sceMp3Init(h) < 0) goto done;
+    sceMp3SetLoopNum(h, 0);
 
-    fill_stream(d);
-    if (sceMp3Init(d->h) < 0) { dec_close(d); return -1; }
+    int rate = sceMp3GetSamplingRate(h);
+    int ch   = sceMp3GetMp3ChannelNum(h);
+    int br   = sceMp3GetBitRate(h);
+    if (rate <= 0 || ch < 1 || ch > 2) goto done;
 
-    d->rate  = sceMp3GetSamplingRate(d->h);
-    d->chans = sceMp3GetMp3ChannelNum(d->h);
-    d->maxs  = sceMp3GetMaxOutputSample(d->h);
-    if (d->maxs <= 0 || d->maxs > 1152) d->maxs = 1152;
-    int kbps = sceMp3GetBitRate(d->h);
-    d->dur_ms = (kbps > 0) ? (int)(((long long)(size - start) * 8) / kbps) : 0;
+    g_rate = rate;
+    g_bitrate = br;
+    g_total = (br > 0) ? (end - start) / (br * 125) : 0;
 
-    d->src = sceAudioSRCChReserve(d->maxs, d->rate, 2);
-    if (d->src < 0) { dec_close(d); return -1; }
-    return 0;
+    if (sceAudioSRCChReserve(OUT_BLOCK, rate, 2) < 0) goto done;
+    src_open = 1;
+
+    g_state = ST_PLAY;
+
+    for (;;) {
+        if (g_quit)                 { result = PR_QUIT;    break; }
+        if (g_req_seq != *seen)     { result = PR_REQUEST; break; }
+        if (g_pause) {
+            g_state = ST_PAUSE;
+            sceKernelDelayThread(20000);
+            continue;
+        }
+        g_state = ST_PLAY;
+
+        if (sceMp3CheckStreamDataNeeded(h) > 0) fill_stream(fd, h);
+
+        SceShort16 *pcm = NULL;
+        int bytes = sceMp3Decode(h, &pcm);
+        if (bytes <= 0 || pcm == NULL) {
+            result = decoded_any ? PR_ENDED : PR_ERROR;
+            break;
+        }
+        decoded_any = 1;
+        sceKernelDcacheWritebackInvalidateRange(pcm, bytes);
+
+        int samples = bytes / (2 * ch);
+        if (acc_n + samples > 2304) samples = 2304 - acc_n;
+        if (ch == 2) {
+            memcpy(g_acc + 2 * acc_n, pcm, (size_t)samples * 4);
+        } else {
+            for (int i = 0; i < samples; i++) {
+                g_acc[2 * (acc_n + i)]     = pcm[i];
+                g_acc[2 * (acc_n + i) + 1] = pcm[i];
+            }
+        }
+        acc_n += samples;
+
+        while (acc_n >= OUT_BLOCK) {
+            sceAudioSRCOutputBlocking(vol_hw(g_volume), g_acc);
+            acc_n -= OUT_BLOCK;
+            memmove(g_acc, g_acc + 2 * OUT_BLOCK, (size_t)acc_n * 4);
+        }
+        g_elapsed = sceMp3GetSumDecodedSample(h) / rate;
+    }
+
+    if (result == PR_ENDED && acc_n > 0) {                 /* play the last bit */
+        memset(g_acc + 2 * acc_n, 0, (size_t)(OUT_BLOCK - acc_n) * 4);
+        sceAudioSRCOutputBlocking(vol_hw(g_volume), g_acc);
+    }
+
+done:
+    if (src_open)  sceAudioSRCChRelease();
+    if (h >= 0)    sceMp3ReleaseMp3Handle(h);
+    if (fd >= 0)   sceIoClose(fd);
+    if (result == PR_ERROR) g_state = ST_ERROR;
+    return result;
 }
 
 static int audio_thread(SceSize args, void *argp)
 {
-    Dec d;
-    d.fd = d.h = d.src = -1;
+    int seen = g_req_seq;
+    (void)args; (void)argp;
 
-    for (;;) {
-        int idx = g_load_idx;
-        if (idx >= 0) {
-            g_load_idx = -1;
-            dec_close(&d);
-            if (dec_open(&d, g_tracks[idx].path) == 0) {
-                g_pos_ms = 0;
-                g_dur_ms = d.dur_ms;
-                g_err = 0;
+    while (!g_quit) {
+        if (g_req_seq == seen) { sceKernelDelayThread(20000); continue; }
+
+        seen = g_req_seq;
+        int track = g_req_track;
+
+        while (track >= 0 && track < g_ntracks && !g_quit) {
+            int res = play_track(track, &seen);
+            if (res == PR_ENDED) {
+                track = (track + 1) % g_ntracks;               /* repeat-all */
+            } else if (res == PR_REQUEST) {
+                seen = g_req_seq;
+                track = g_req_track;
             } else {
-                g_err = 1;
-                g_playing = 0;
+                track = -2;                                    /* error / quit */
             }
-            continue;
         }
-
-        if (d.h < 0 || !g_playing) {
-            sceKernelDelayThread(20000);
-            continue;
+        if (track == -1 && !g_quit) {                          /* explicit stop */
+            g_state = ST_STOP;
+            g_elapsed = 0;
         }
-
-        if (sceMp3CheckStreamDataNeeded(d.h) > 0) fill_stream(&d);
-
-        short *pcm = NULL;
-        int bytes = sceMp3Decode(d.h, &pcm);
-        if (bytes <= 0 || !pcm) {
-            dec_close(&d);
-            g_ended = 1;
-            continue;
-        }
-
-        int want = d.maxs * 2;               /* shorts for a full stereo frame */
-        int n = 0;
-        if (d.chans == 1 && bytes <= d.maxs * 2) {
-            int fr = bytes / 2;              /* mono -> stereo */
-            for (int i = 0; i < fr && n + 1 < want; i++) {
-                outBuf[n++] = pcm[i];
-                outBuf[n++] = pcm[i];
-            }
-            d.frames += fr;
-        } else {
-            int sh = bytes / 2;
-            if (sh > want) sh = want;
-            memcpy(outBuf, pcm, sh * 2);
-            n = sh;
-            d.frames += sh / 2;
-        }
-        while (n < want) outBuf[n++] = 0;
-
-        int v = g_volume;
-        sceAudioSRCOutputBlocking(v * v * PSP_AUDIO_VOLUME_MAX / 400, outBuf);
-        g_pos_ms = (int)((unsigned long long)d.frames * 1000ULL / (unsigned)d.rate);
     }
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Config + system                                                     */
-/* ------------------------------------------------------------------ */
-
-static void load_cfg(void)
+static void req_play(int idx)
 {
-    SceUID f = sceIoOpen(CFG_PATH, PSP_O_RDONLY, 0777);
-    if (f < 0) return;
-    char c = '0';
-    if (sceIoRead(f, &c, 1) == 1 && c >= '0' && c < '0' + THEME_COUNT) g_theme = c - '0';
-    sceIoClose(f);
+    if (!g_audio_ok) return;
+    g_req_track = idx;
+    g_req_seq = g_req_seq + 1;
 }
 
-static void save_cfg(void)
+/* ------------------------------------------------------------- callbacks */
+static int exit_cb(int a1, int a2, void *common)
 {
-    SceUID f = sceIoOpen(CFG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (f < 0) return;
-    char c = (char)('0' + g_theme);
-    sceIoWrite(f, &c, 1);
-    sceIoClose(f);
-}
-
-static int exit_callback(int a1, int a2, void *c)
-{
-    sceKernelExitGame();
+    (void)a1; (void)a2; (void)common;
+    g_running = 0;
     return 0;
 }
 
-static int callback_thread(SceSize args, void *argp)
+static int cb_thread(SceSize args, void *argp)
 {
-    int cb = sceKernelCreateCallback("exit", exit_callback, NULL);
-    sceKernelRegisterExitCallback(cb);
+    (void)args; (void)argp;
+    int id = sceKernelCreateCallback("exit_cb", exit_cb, NULL);
+    sceKernelRegisterExitCallback(id);
     sceKernelSleepThreadCB();
     return 0;
 }
 
 static void setup_callbacks(void)
 {
-    int th = sceKernelCreateThread("cb", callback_thread, 0x11, 0xFA0, PSP_THREAD_ATTR_USER, NULL);
-    if (th >= 0) sceKernelStartThread(th, 0, NULL);
+    int t = sceKernelCreateThread("cb_thread", cb_thread, 0x11, 0xFA0, PSP_THREAD_ATTR_USER, NULL);
+    if (t >= 0) sceKernelStartThread(t, 0, NULL);
 }
 
-/* ------------------------------------------------------------------ */
-/* UI                                                                  */
-/* ------------------------------------------------------------------ */
-
-static int g_sel = 0, g_top = 0, g_cur = -1;
-
-typedef struct { int sel, top, cur, playing, sec, vol, theme, err, count; } UiState;
-
-static void draw_ui(void)
+/* ---------------------------------------------------------------- input */
+static int rep(unsigned btn, unsigned bit, int *hold)   /* press + auto-repeat */
 {
-    const Theme *t = &THEMES[g_theme];
-    char buf[96];
-
-    memcpy(vram, g_bg, sizeof(g_bg));
-
-    /* header */
-    text_bold(14, 6, t->text, "SOFT CLUB PLAYER");
-    sprintf(buf, "%s  %d/%d", t->name, g_theme + 1, THEME_COUNT);
-    text(SCR_W - 14 - (int)strlen(buf) * 8, 6, t->dim, buf);
-
-    /* now playing panel */
-    const char *state = g_err ? "ERROR - CAN'T PLAY FILE"
-                      : (g_cur < 0) ? "STOPPED"
-                      : g_playing ? "NOW PLAYING" : "PAUSED";
-    text_bold(22, 38, t->accent2, state);
-    if (g_count > 0) {
-        sprintf(buf, "%d/%d", (g_cur >= 0 ? g_cur : g_sel) + 1, g_count);
-        text(SCR_W - 22 - (int)strlen(buf) * 8, 38, t->dim, buf);
-    }
-
-    if (g_cur >= 0)
-        text_clip(22, 51, t->text, g_tracks[g_cur].disp, 52, 1);
-    else
-        text(22, 51, t->dim, "Pick a track and press X");
-
-    int pos = g_pos_ms, dur = g_dur_ms;
-    char a[16], b[16];
-    fmt_time(a, pos);
-    fmt_time(b, dur);
-    sprintf(buf, "%s / %s", a, b);
-    text(22, 64, t->text, buf);
-
-    /* volume */
-    text(318, 64, t->dim, "VOL");
-    rrect(vram, 350, 66, 108, 6, 3, t->bar_bg, 255);
-    int vw = g_volume * 108 / 20;
-    if (vw > 5) rrect(vram, 350, 66, vw, 6, 3, t->accent2, 255);
-
-    /* progress */
-    rrect(vram, 22, 78, 436, 8, 4, t->bar_bg, 255);
-    if (dur > 0) {
-        int pw = (int)((long long)pos * 436 / dur);
-        if (pw > 436) pw = 436;
-        if (pw > 8) rrect(vram, 22, 78, pw, 8, 4, t->accent, 255);
-    }
-
-    /* list */
-    if (g_count == 0) {
-        text(24, 150, t->text, "No MP3 files found in ms0:/MUSIC/");
-    } else {
-        for (int i = 0; i < VISIBLE; i++) {
-            int idx = g_top + i;
-            if (idx >= g_count) break;
-            int y = 112 + i * ROW_H;
-            u32 col = t->text;
-            if (idx == g_sel) {
-                rrect(vram, 16, y - 3, 436, 13, 5, t->sel_bg, 255);
-                col = t->sel_text;
-            }
-            text(24, y, (idx == g_cur && idx != g_sel) ? t->accent2 : col,
-                 (idx == g_cur) ? ">" : " ");
-            text_clip(40, y, col, g_tracks[idx].disp, 50, 0);
-        }
-        /* scrollbar */
-        if (g_count > VISIBLE) {
-            rrect(vram, 459, 110, 4, 128, 2, t->bar_bg, 255);
-            int th = 128 * VISIBLE / g_count;
-            if (th < 10) th = 10;
-            int ty = 110 + (128 - th) * g_top / (g_count - VISIBLE);
-            rrect(vram, 459, ty, 4, th, 2, t->accent, 255);
-        }
-    }
-
-    /* footer */
-    const char *hint = "X:Play O:Pause L/R:Skip <>:Vol TRI/SQ:Theme";
-    text((SCR_W - (int)strlen(hint) * 8) / 2, 254, t->dim, hint);
+    if (!(btn & bit)) { *hold = 0; return 0; }
+    (*hold)++;
+    if (*hold == 1) return 1;
+    return (*hold > 20 && ((*hold - 20) % 4) == 0);
 }
 
-static void play_track(int idx)
+int main(int argc, char **argv)
 {
-    if (idx < 0 || idx >= g_count) return;
-    g_cur = idx;
-    g_ended = 0;
-    g_err = 0;
-    g_pos_ms = 0;
-    g_dur_ms = 0;
-    g_playing = 1;
-    g_load_idx = idx;
-}
+    SceUID audio_th = -1;
 
-static void select_track(int idx)
-{
-    if (g_count == 0) return;
-    if (idx < 0) idx = g_count - 1;
-    if (idx >= g_count) idx = 0;
-    g_sel = idx;
-    if (g_sel < g_top) g_top = g_sel;
-    if (g_sel >= g_top + VISIBLE) g_top = g_sel - VISIBLE + 1;
-}
-
-static int rep(u32 btn, u32 now, u32 old, int *cnt)
-{
-    if (now & btn) {
-        (*cnt)++;
-        if (!(old & btn)) return 1;
-        if (*cnt > 18 && (*cnt % 4) == 0) return 1;
-    } else {
-        *cnt = 0;
-    }
-    return 0;
-}
-
-static void set_theme(int t)
-{
-    g_theme = (t + THEME_COUNT) % THEME_COUNT;
-    render_theme();
-    save_cfg();
-}
-
-int main(int argc, char *argv[])
-{
     setup_callbacks();
-    scePowerSetClockFrequency(222, 222, 111);
-
-    pspDebugScreenInit();
-    pspDebugScreenEnableBackColor(0);
-    vram = (u32 *)(0x40000000 | (u32)sceGeEdramGetAddr());
-
-    sceUtilityLoadModule(PSP_MODULE_AV_AVCODEC);
-    sceUtilityLoadModule(PSP_MODULE_AV_MP3);
-    sceMp3InitResource();
-
-    load_cfg();
-    render_theme();
-    scan_tracks();
-
-    int th = sceKernelCreateThread("audio", audio_thread, 0x12, 0x10000, PSP_THREAD_ATTR_USER, NULL);
-    if (th >= 0) sceKernelStartThread(th, 0, NULL);
+    scePowerSetClockFrequency(266, 266, 133);
+    init_paths(argc > 0 ? argv[0] : NULL);
+    cfg_load();
+    scan_music();
 
     sceCtrlSetSamplingCycle(0);
-    sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+    init_display();
 
-    SceCtrlData pad;
-    u32 old = 0;
-    int c_up = 0, c_dn = 0, c_lf = 0, c_rt = 0;
-    UiState last;
-    memset(&last, 0xFF, sizeof(last));
-
-    for (;;) {
-        sceCtrlPeekBufferPositive(&pad, 1);
-        u32 now = pad.Buttons;
-        u32 pressed = now & ~old;
-
-        if (rep(PSP_CTRL_UP, now, old, &c_up))   select_track(g_sel - 1);
-        if (rep(PSP_CTRL_DOWN, now, old, &c_dn)) select_track(g_sel + 1);
-        if (rep(PSP_CTRL_LEFT, now, old, &c_lf)  && g_volume > 0)  g_volume--;
-        if (rep(PSP_CTRL_RIGHT, now, old, &c_rt) && g_volume < 20) g_volume++;
-
-        if (pressed & PSP_CTRL_CROSS) {
-            if (g_sel == g_cur && !g_err) g_playing = !g_playing;
-            else play_track(g_sel);
-        }
-        if (pressed & PSP_CTRL_CIRCLE) {
-            if (g_cur >= 0) g_playing = !g_playing;
-            else play_track(g_sel);
-        }
-        if ((pressed & PSP_CTRL_RTRIGGER) && g_count > 0) {
-            int n = (g_cur < 0 ? g_sel : g_cur) + 1;
-            if (n >= g_count) n = 0;
-            play_track(n); select_track(n);
-        }
-        if ((pressed & PSP_CTRL_LTRIGGER) && g_count > 0) {
-            int n = (g_cur < 0 ? g_sel : g_cur) - 1;
-            if (n < 0) n = g_count - 1;
-            play_track(n); select_track(n);
-        }
-        if (pressed & PSP_CTRL_TRIANGLE) set_theme(g_theme + 1);
-        if (pressed & PSP_CTRL_SQUARE)   set_theme(g_theme - 1);
-
-        if (g_ended) {
-            g_ended = 0;
-            if (g_count > 0) {
-                int n = (g_cur + 1) % g_count;
-                play_track(n); select_track(n);
-            }
-        }
-
-        old = now;
-
-        UiState s = { g_sel, g_top, g_cur, g_playing, g_pos_ms / 1000,
-                      g_volume, g_theme, g_err, g_count };
-        sceDisplayWaitVblankStart();
-        if (memcmp(&s, &last, sizeof(s)) != 0) {
-            draw_ui();
-            last = s;
-        }
+    /* MP3 decoder modules (need custom firmware / PSP-1000+ firmware features) */
+    if (sceUtilityLoadModule(PSP_MODULE_AV_AVCODEC) >= 0 &&
+        sceUtilityLoadModule(PSP_MODULE_AV_MP3) >= 0 &&
+        sceMp3InitResource() >= 0) {
+        audio_th = sceKernelCreateThread("audio", audio_thread, 0x12, 0x10000, PSP_THREAD_ATTR_USER, NULL);
+        if (audio_th >= 0 && sceKernelStartThread(audio_th, 0, NULL) >= 0) g_audio_ok = 1;
     }
+    if (!g_audio_ok) g_err = "MP3 DECODER NOT AVAILABLE";
+
+    render_bg(&THEMES[g_theme]);
+
+    UiState last;
+    memset(&last, 0xFF, sizeof last);
+    int sel = 0, top = 0, prev_cur = -1, frame = 0;
+    unsigned old = 0;
+    int hold[4] = { 0, 0, 0, 0 };
+
+    while (g_running) {
+        SceCtrlData pad;
+        sceCtrlPeekBufferPositive(&pad, 1);
+        unsigned btn = pad.Buttons, down = btn & ~old;
+        old = btn;
+        int n = g_ntracks;
+        int cur = g_cur;
+
+        if (rep(btn, PSP_CTRL_UP,    &hold[0]) && sel > 0)     sel--;
+        if (rep(btn, PSP_CTRL_DOWN,  &hold[1]) && sel < n - 1) sel++;
+        if (rep(btn, PSP_CTRL_LEFT,  &hold[2])) g_volume = clampi(g_volume - 5, 0, 100);
+        if (rep(btn, PSP_CTRL_RIGHT, &hold[3])) g_volume = clampi(g_volume + 5, 0, 100);
+
+        if ((down & PSP_CTRL_CROSS) && n > 0) {
+            int st = g_state;
+            if (sel == cur && (st == ST_PLAY || st == ST_PAUSE)) g_pause = !g_pause;
+            else req_play(sel);
+        }
+        if ((down & PSP_CTRL_CIRCLE) && (g_state == ST_PLAY || g_state == ST_PAUSE)) g_pause = !g_pause;
+        if ((down & PSP_CTRL_SQUARE) && n > 0) req_play(-1);
+        if ((down & PSP_CTRL_LTRIGGER) && n > 0) {
+            int base = (cur >= 0) ? cur : sel;
+            sel = (base + n - 1) % n;
+            req_play(sel);
+        }
+        if ((down & PSP_CTRL_RTRIGGER) && n > 0) {
+            int base = (cur >= 0) ? cur : sel;
+            sel = (base + 1) % n;
+            req_play(sel);
+        }
+        if (down & PSP_CTRL_TRIANGLE) {
+            g_theme = (g_theme + 1) % N_THEMES;
+            render_bg(&THEMES[g_theme]);
+            cfg_save();
+        }
+
+        /* selection follows the playing track when the player advances by itself */
+        cur = g_cur;
+        if (cur != prev_cur) {
+            if (prev_cur < 0 || sel == prev_cur) sel = cur >= 0 ? cur : sel;
+            prev_cur = cur;
+        }
+        sel = clampi(sel, 0, n > 0 ? n - 1 : 0);
+        if (sel < top) top = sel;
+        if (sel >= top + LIST_ROWS) top = sel - LIST_ROWS + 1;
+        if (top < 0) top = 0;
+
+        UiState u;
+        u.state = g_state;  u.cur = cur;
+        u.elapsed = g_elapsed; u.total = g_total;
+        u.bitrate = g_bitrate; u.rate = g_rate;
+        u.vol = g_volume;   u.theme = g_theme;
+        u.sel = sel;        u.top = top;
+        u.ntr = n;
+        u.tick = 0;
+        if (u.cur >= 0 && n > 0 && text_w(&F_B, g_tracks[u.cur].title, 2) > 447) u.tick = frame / 3;
+
+        if (memcmp(&u, &last, sizeof u) != 0) {
+            render_ui(&u);
+            present();
+            last = u;
+        }
+        frame++;
+        sceDisplayWaitVblankStart();
+    }
+
+    /* shut down cleanly */
+    g_quit = 1;
+    if (audio_th >= 0) {
+        sceKernelWaitThreadEnd(audio_th, NULL);
+        sceKernelDeleteThread(audio_th);
+    }
+    if (g_audio_ok) sceMp3TermResource();
+    cfg_save();
+    sceKernelExitGame();
     return 0;
 }
